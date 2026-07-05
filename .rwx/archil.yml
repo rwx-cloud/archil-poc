@@ -1,0 +1,107 @@
+on:
+  cli:
+    init:
+      disk: rwx/dan-testing
+      region: aws-us-east-1
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.2
+
+tasks:
+  - key: install-archil
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libfuse2t64
+      curl -sSf https://archil.com/install | sh
+      archil --version
+
+  - key: archil-demo
+    use: install-archil
+    env:
+      ARCHIL_MOUNT_TOKEN: ${{ secrets.ARCHIL_MOUNT_TOKEN }}
+    run: |
+      set -euo pipefail
+
+      echo "=== mounting ${{ init.disk }} (${{ init.region }}) ==="
+      sudo mkdir -p /mnt/archil
+      sudo --preserve-env=ARCHIL_MOUNT_TOKEN archil mount \
+        "${{ init.disk }}" /mnt/archil \
+        --region "${{ init.region }}" \
+        --shared
+      mountpoint /mnt/archil
+      trap 'sudo archil unmount /mnt/archil || true' EXIT
+
+      echo "=== existing contents of /mnt/archil ==="
+      ls -la /mnt/archil
+      find /mnt/archil -maxdepth 3 -type f 2>/dev/null | head -20 || true
+
+      echo "=== writing files for this run ==="
+      # Shared mode is read-only by default. Creating a brand-new directory
+      # grants this client dynamic ownership of it, so we can write into it.
+      # We create/write with sudo (archil runs as root here) and never touch
+      # files owned by other runs, so no recursive chown is needed.
+      RUN_DIR="/mnt/archil/rwx-runs/${RWX_RUN_ID:-local}"
+      sudo mkdir -p "$RUN_DIR"
+      echo "Hello from RWX run ${RWX_RUN_ID:-local} at $(date -u +%FT%TZ)" \
+        | sudo tee "$RUN_DIR/greeting.txt" > /dev/null
+      uname -a | sudo tee "$RUN_DIR/host.txt" > /dev/null
+      sudo ls -la "$RUN_DIR"
+
+      echo "=== reading back ==="
+      cat "$RUN_DIR/greeting.txt"
+      cat "$RUN_DIR/host.txt"
+
+      echo "=== current ownership delegations ==="
+      sudo archil delegations /mnt/archil
+
+      echo "=== unmounting ==="
+      sudo archil unmount /mnt/archil
+      trap - EXIT
+
+  - key: benchmark
+    use: archil-demo
+    env:
+      ARCHIL_MOUNT_TOKEN: ${{ secrets.ARCHIL_MOUNT_TOKEN }}
+    run: |
+      set -euo pipefail
+
+      mount_disk() {
+        sudo --preserve-env=ARCHIL_MOUNT_TOKEN archil mount \
+          "${{ init.disk }}" /mnt/archil \
+          --region "${{ init.region }}" \
+          --shared
+      }
+
+      sudo mkdir -p /mnt/archil
+
+      echo "=== generating 100 MB of random data in /tmp ==="
+      dd if=/dev/urandom of=/tmp/bench.bin bs=1M count=100 status=none
+      ls -la /tmp/bench.bin
+
+      echo "=== mount #1 ==="
+      mount_disk
+      # Per-run directory so concurrent/previous runs don't collide. Creating
+      # it grants dynamic ownership, so writes succeed in shared (read-only)
+      # mode without checkout or chown. All writes go through sudo.
+      BENCH_DIR="/mnt/archil/bench/${RWX_RUN_ID:-local}"
+      sudo mkdir -p "$BENCH_DIR"
+
+      echo "=== write benchmark: 100 MB (includes fsync) ==="
+      sudo dd if=/tmp/bench.bin of="$BENCH_DIR/bench.bin" bs=1M conv=fsync
+      sudo ls -la "$BENCH_DIR/bench.bin"
+
+      echo "=== unmount (flushes + drops local cache) ==="
+      sudo archil unmount /mnt/archil
+
+      echo "=== mount #2 (fresh cache) ==="
+      mount_disk
+
+      echo "=== read benchmark: 100 MB ==="
+      sudo dd if="$BENCH_DIR/bench.bin" of=/dev/null bs=1M
+
+      echo "=== integrity check ==="
+      sudo sha256sum /tmp/bench.bin "$BENCH_DIR/bench.bin"
+
+      echo "=== unmount ==="
+      sudo archil unmount /mnt/archil
