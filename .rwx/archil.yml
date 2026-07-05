@@ -105,3 +105,110 @@ tasks:
 
       echo "=== unmount ==="
       sudo archil unmount /mnt/archil
+
+  - key: benchmark-small-files
+    use: install-archil
+    # Small-file I/O over the network is far slower per byte than the bulk
+    # benchmark, so raise the default 10-minute task timeout.
+    timeout: 30m
+    env:
+      ARCHIL_MOUNT_TOKEN: ${{ secrets.ARCHIL_MOUNT_TOKEN }}
+    run: |
+      set -euo pipefail
+
+      mount_disk() {
+        sudo --preserve-env=ARCHIL_MOUNT_TOKEN archil mount \
+          "${{ init.disk }}" /mnt/archil \
+          --region "${{ init.region }}" \
+          --shared
+      }
+
+      # Many-small-files benchmark. Tune NUM_FILES to scale the workload;
+      # total size = NUM_FILES * FILE_SIZE. 102400 x 1 KiB == 100 MiB, but the
+      # cold sequential content read runs at ~17 ms/file, so a full 100 MiB
+      # would take ~30 min. 12000 files keeps the task within ~5 minutes.
+      NUM_FILES=12000
+      FILE_SIZE=1024
+      SRC=/tmp/smallfiles
+      DEST="/mnt/archil/small-files/${RWX_RUN_ID:-local}"
+
+      now_ns() { date +%s%N; }
+      # report <label> <elapsed_ns> <bytes> <count>
+      report() {
+        awk -v n="$1" -v ns="$2" -v b="$3" -v c="$4" 'BEGIN {
+          s = ns / 1e9;
+          printf "  %-26s %8.3f s   %8.2f MB/s   %10.0f files/s\n", \
+            n, s, (b / 1048576) / s, c / s;
+        }'
+      }
+
+      echo "=== generating ${NUM_FILES} x ${FILE_SIZE} B files locally ==="
+      # Generate in a single fast pass: one blob split into exact FILE_SIZE
+      # pieces. This avoids per-file shell forks so generation time (which we do
+      # NOT benchmark) stays small and doesn't pollute the Archil measurements.
+      rm -rf "$SRC"; mkdir -p "$SRC"
+      dd if=/dev/urandom of=/tmp/blob.bin bs="$FILE_SIZE" count="$NUM_FILES" status=none
+      split -b "$FILE_SIZE" -d -a 6 /tmp/blob.bin "$SRC/f_"
+      GEN_COUNT=$(find "$SRC" -type f | wc -l)
+      SRC_BYTES=$(du -sb "$SRC" | cut -f1)
+      echo "  generated ${GEN_COUNT} files, ${SRC_BYTES} bytes"
+
+      echo "=== mount #1 ==="
+      sudo mkdir -p /mnt/archil
+      mount_disk
+      # New per-run dir -> dynamic ownership grants write access in shared mode.
+      sudo mkdir -p "$DEST"
+
+      echo "=== write benchmark: create ${NUM_FILES} x 1 KiB files ==="
+      t0=$(now_ns)
+      sudo cp -r "$SRC/." "$DEST/"
+      t1=$(now_ns)
+      WRITE_NS=$((t1 - t0))
+
+      echo "=== flush benchmark: unmount (fsync all + drop cache) ==="
+      t0=$(now_ns)
+      sudo archil unmount /mnt/archil
+      t1=$(now_ns)
+      FLUSH_NS=$((t1 - t0))
+
+      echo "=== mount #2 (fresh cache) ==="
+      mount_disk
+
+      echo "=== read benchmark (cold): metadata walk ==="
+      t0=$(now_ns)
+      DEST_COUNT=$(find "$DEST" -type f | wc -l)
+      t1=$(now_ns)
+      LIST_NS=$((t1 - t0))
+
+      echo "=== read benchmark (cold): full content (hash manifest) ==="
+      # One sequential pass that reads every byte; the sha256 doubles as the
+      # integrity manifest, so DEST content is read exactly once.
+      t0=$(now_ns)
+      find "$DEST" -type f -print0 | xargs -0 sha256sum > /tmp/dest.manifest
+      t1=$(now_ns)
+      READ_NS=$((t1 - t0))
+
+      echo "=== integrity check ==="
+      # SRC manifest is local disk (fast); compare the sorted hash multisets.
+      find "$SRC" -type f -print0 | xargs -0 sha256sum > /tmp/src.manifest
+      DEST_BYTES=$(du -sb "$DEST" | cut -f1)
+      SRC_HASH=$(awk '{print $1}' /tmp/src.manifest | sort | sha256sum | cut -d' ' -f1)
+      DEST_HASH=$(awk '{print $1}' /tmp/dest.manifest | sort | sha256sum | cut -d' ' -f1)
+      echo "  files:       src=${GEN_COUNT}  dest=${DEST_COUNT}"
+      echo "  bytes:       src=${SRC_BYTES}  dest=${DEST_BYTES}"
+      echo "  fingerprint: src=${SRC_HASH}"
+      echo "  fingerprint: dest=${DEST_HASH}"
+      if [ "$SRC_HASH" != "$DEST_HASH" ] || [ "$GEN_COUNT" != "$DEST_COUNT" ]; then
+        echo "INTEGRITY CHECK FAILED" >&2
+        exit 1
+      fi
+      echo "  integrity OK"
+
+      echo "=== results: ${NUM_FILES} x ${FILE_SIZE} B small-file benchmark ==="
+      report "write (create files)"   "$WRITE_NS" "$SRC_BYTES" "$NUM_FILES"
+      report "flush (unmount)"        "$FLUSH_NS" "$SRC_BYTES" "$NUM_FILES"
+      report "read - metadata walk"   "$LIST_NS"  "$SRC_BYTES" "$NUM_FILES"
+      report "read - full content"    "$READ_NS"  "$SRC_BYTES" "$NUM_FILES"
+
+      echo "=== unmount ==="
+      sudo archil unmount /mnt/archil
