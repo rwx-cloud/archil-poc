@@ -212,3 +212,113 @@ tasks:
 
       echo "=== unmount ==="
       sudo archil unmount /mnt/archil
+
+  - key: benchmark-small-files-prefetch
+    # Runs after benchmark-small-files (via `use`) so the cold and prefetched
+    # reads are measured back-to-back in the same run, without competing for the
+    # disk. Same workload; the only difference is `archil prefetch` + a fixed
+    # warmup wait before the read, so reads should hit warm cache.
+    use: benchmark-small-files
+    timeout: 30m
+    env:
+      ARCHIL_MOUNT_TOKEN: ${{ secrets.ARCHIL_MOUNT_TOKEN }}
+    run: |
+      set -euo pipefail
+
+      mount_disk() {
+        sudo --preserve-env=ARCHIL_MOUNT_TOKEN archil mount \
+          "${{ init.disk }}" /mnt/archil \
+          --region "${{ init.region }}" \
+          --shared
+      }
+
+      NUM_FILES=12000           # match the cold baseline for apples-to-apples
+      FILE_SIZE=1024
+      PREFETCH_WAIT=90          # seconds to let background prefetch warm cache
+      SRC=/tmp/smallfiles
+      DEST="/mnt/archil/small-files-prefetch/${RWX_RUN_ID:-local}"
+
+      now_ns() { date +%s%N; }
+      # report <label> <elapsed_ns> <bytes> <count>
+      report() {
+        awk -v n="$1" -v ns="$2" -v b="$3" -v c="$4" 'BEGIN {
+          s = ns / 1e9;
+          printf "  %-30s %8.3f s   %8.2f MB/s   %10.0f files/s\n", \
+            n, s, (b / 1048576) / s, c / s;
+        }'
+      }
+
+      echo "=== generating ${NUM_FILES} x ${FILE_SIZE} B files locally ==="
+      rm -rf "$SRC"; mkdir -p "$SRC"
+      dd if=/dev/urandom of=/tmp/blob.bin bs="$FILE_SIZE" count="$NUM_FILES" status=none
+      split -b "$FILE_SIZE" -d -a 6 /tmp/blob.bin "$SRC/f_"
+      GEN_COUNT=$(find "$SRC" -type f | wc -l)
+      SRC_BYTES=$(du -sb "$SRC" | cut -f1)
+      echo "  generated ${GEN_COUNT} files, ${SRC_BYTES} bytes"
+
+      echo "=== mount #1 ==="
+      sudo mkdir -p /mnt/archil
+      mount_disk
+      sudo mkdir -p "$DEST"
+
+      echo "=== write ${NUM_FILES} files ==="
+      sudo cp -r "$SRC/." "$DEST/"
+
+      echo "=== unmount (flush + drop cache) ==="
+      sudo archil unmount /mnt/archil
+
+      echo "=== mount #2 (fresh cache) ==="
+      mount_disk
+
+      # `archil prefetch <ABSOLUTE_PATH>...` warms paths into cache in the
+      # background and returns immediately (per its --help). IMPORTANT: prefetch
+      # is documented as "Native-format filesystems only" — the object-storage
+      # backed disk rwx/dan-testing returns InvalidArguments for every path form.
+      # We run it best-effort and only wait for warmup if it was accepted, so
+      # this task also works unchanged on a native-format disk.
+      echo "=== prefetch ${DEST} ==="
+      t0=$(now_ns)
+      if sudo archil prefetch "$DEST"; then
+        t1=$(now_ns)
+        awk -v ns="$((t1 - t0))" 'BEGIN { printf "  prefetch accepted, returned in %.3f s (async)\n", ns / 1e9 }'
+        echo "  waiting ${PREFETCH_WAIT}s for background warmup..."
+        sleep "$PREFETCH_WAIT"
+        PREFETCH_STATE="ok (${PREFETCH_WAIT}s warmup)"
+      else
+        echo "  prefetch NOT supported for this disk (native-format filesystems"
+        echo "  only) -> reads below are effectively cold; skipping warmup wait"
+        PREFETCH_STATE="unsupported"
+      fi
+      sudo archil status /mnt/archil || true
+
+      echo "=== read (post-prefetch): metadata walk ==="
+      t0=$(now_ns)
+      DEST_COUNT=$(find "$DEST" -type f | wc -l)
+      t1=$(now_ns)
+      LIST_NS=$((t1 - t0))
+
+      echo "=== read (post-prefetch): full content (hash manifest) ==="
+      t0=$(now_ns)
+      find "$DEST" -type f -print0 | xargs -0 sha256sum > /tmp/dest.manifest
+      t1=$(now_ns)
+      READ_NS=$((t1 - t0))
+
+      echo "=== integrity check ==="
+      find "$SRC" -type f -print0 | xargs -0 sha256sum > /tmp/src.manifest
+      SRC_HASH=$(awk '{print $1}' /tmp/src.manifest | sort | sha256sum | cut -d' ' -f1)
+      DEST_HASH=$(awk '{print $1}' /tmp/dest.manifest | sort | sha256sum | cut -d' ' -f1)
+      echo "  files:       src=${GEN_COUNT}  dest=${DEST_COUNT}"
+      echo "  fingerprint: src=${SRC_HASH}"
+      echo "  fingerprint: dest=${DEST_HASH}"
+      if [ "$SRC_HASH" != "$DEST_HASH" ] || [ "$GEN_COUNT" != "$DEST_COUNT" ]; then
+        echo "INTEGRITY CHECK FAILED" >&2
+        exit 1
+      fi
+      echo "  integrity OK"
+
+      echo "=== results: ${NUM_FILES} x ${FILE_SIZE} B (prefetch: ${PREFETCH_STATE}) ==="
+      report "read - metadata walk"    "$LIST_NS" "$SRC_BYTES" "$NUM_FILES"
+      report "read - full content"     "$READ_NS" "$SRC_BYTES" "$NUM_FILES"
+
+      echo "=== unmount ==="
+      sudo archil unmount /mnt/archil

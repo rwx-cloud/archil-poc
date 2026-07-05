@@ -7,6 +7,8 @@ mounted inside RWX task containers:
   [`234ae5ace1bf4a85831389b744e6ab3b`](https://cloud.rwx.com/mint/rwx/runs/234ae5ace1bf4a85831389b744e6ab3b)
 - **Small files** — 12,000 × 1 KiB files:
   [`6a11cbe188d44e76bb569dc84ff1b88b`](https://cloud.rwx.com/mint/rwx/runs/6a11cbe188d44e76bb569dc84ff1b88b)
+- **Prefetch A/B** — 12,000 × 1 KiB, cold vs. `archil prefetch`:
+  [`14d3c621ae614bd3b564363a6a225e2b`](https://cloud.rwx.com/mint/rwx/runs/14d3c621ae614bd3b564363a6a225e2b)
 
 ## Environment
 
@@ -82,50 +84,67 @@ out at the default 10-minute task limit** — at ~21.5 ms/file the cold sequenti
 read alone projects to ~30 minutes. The task now sets `timeout: 30m`, and the
 file count is tuned (`NUM_FILES`) to keep a single run within ~5 minutes; 12,000
 files lands at ~4.6 min of task execution. To benchmark the full 100 MiB
-practically, the cold read would need concurrency (e.g. `xargs -P`) or Archil
-prefetch (below) to hide per-file latency — sequential access does not scale to
-six-figure file counts here.
+practically, the cold read would need concurrency (e.g. `xargs -P`) to hide
+per-file latency — sequential access does not scale to six-figure file counts
+here. (Archil `prefetch` would be the other lever, but it is unusable on this
+disk — see [prefetch options](#archil-read-ahead--prefetch-options).)
 
 ## Archil read-ahead / prefetch options
 
 Archil has **no explicit sequential "read-ahead" flag** (the strings
 "read-ahead"/"readahead" do not appear in its docs or CLI). The mechanism it
-offers for hiding read latency is **prefetch** — proactively warming the local
-cache — plus cache-sizing controls. These are the relevant knobs for the
-small-file cold-read problem above:
+offers for hiding read latency is **prefetch** — proactively warming the cache —
+plus cache-sizing controls:
 
 | Option | Where | What it does |
 |---|---|---|
-| `--pre-fetch <paths>` | `archil mount` flag | Comma-separated paths warmed into cache right after mount (e.g. `--pre-fetch models,data/2024`). |
-| `archil prefetch <mount> <path>…` | command | Warms specific paths post-mount. **Recurses into directories**, **returns immediately**, and continues fetching in the **background**. |
-| `--max-cache-mb <MiB>` | `archil mount` flag | Cache ceiling. Default: min(¼ of RAM, 2048 MiB). Prefetched data counts against this; oversized sets evict earlier entries. |
+| `archil prefetch <ABSOLUTE_PATH>…` | command | Warms paths (and their ancestor dirs) into cache; **returns immediately**, fetches in the **background**. Takes absolute paths under a mount, e.g. `archil prefetch /mnt/archil/a/b`. **Native-format filesystems only.** |
+| `--pre-fetch <paths>` | `archil mount` flag | Comma-separated paths warmed into cache right after mount. |
+| `--max-cache-mb <MiB>` | `archil mount` flag | Cache ceiling. Default: min(¼ of RAM, 2048 MiB). |
 | `--target-cache-mb <MiB>` | `archil mount` flag | Steady-state cache target. Default: 75% of max. |
 | `archil set-cache-expiry` | command | Tunes how long `readdir` results are cached. |
 | `archil invalidate-cache` | command | Forces fresh server reads. |
 
-**How this applies to small files.** The 21.5 ms/file cost is per-file backend
-round-trip latency incurred serially at read time. Because `archil prefetch`
-recurses over a directory in the background (and warms the cache concurrently
-rather than one blocking `open()` at a time), kicking it off immediately after
-mount lets fetching overlap with other task work, so by the time the reader
-reaches each file it is already local. In effect prefetch is Archil's substitute
-for OS read-ahead — bulk/directory-level rather than per-stream.
+### Measured: prefetch does not help on this disk
 
-Suggested usage in the benchmark / real jobs:
+The `benchmark-small-files-prefetch` task writes the same 12k × 1 KiB set,
+remounts cold, runs `archil prefetch`, waits a fixed warmup window, then reads.
+Result: **`archil prefetch` is not usable on `rwx/dan-testing`.** Its `--help`
+states it works on *"Native-format filesystems only"*, and this disk is
+object-storage-backed, so every path form (relative, absolute, and the
+docs' `<mount> <path>` form) fails with `InvalidArguments`:
 
-```bash
-mount_disk
-# Warm the whole tree in the background right after mounting.
-sudo archil prefetch /mnt/archil "small-files/${RWX_RUN_ID}"
-# ...do other setup while the cache fills...
-# Reads now hit warm cache instead of paying 21.5 ms/file cold.
+```
+$ archil prefetch --help
+Pre-fetch one or more paths (and all their ancestor directories) into the
+server's metadata cache ... Native-format filesystems only
+Usage: archil prefetch [OPTIONS] [PATHS]...
+  [PATHS]...  One or more absolute paths under Archil mounts, e.g. /mnt/archil/a/b/c
+
+$ archil prefetch /mnt/archil/small-files-prefetch/<run-id>
+prefetch '...': failed: InvalidArguments
 ```
 
-Caveats: prefetch is asynchronous, so a read that races ahead of the warm-up
-still blocks until its data lands; and prefetched bytes consume cache, so for
-datasets larger than the default cache raise `--max-cache-mb`. **This has not yet
-been measured** — a natural next experiment is a `benchmark-small-files` variant
-that prefetches after mount #2 and compares the cold-read MB/s.
+With prefetch rejected, the "post-prefetch" read is just another cold read, and
+it matches the cold baseline within run-to-run noise — i.e. **no speedup**:
+
+| Read (12k × 1 KiB, cold) | Baseline | After prefetch attempt |
+|---|---|---|
+| metadata walk | 2,141 files/s | 2,853 files/s |
+| full content | **0.05 MB/s** (47 files/s) | **0.06 MB/s** (60 files/s) |
+
+`archil status` reports only mount state (disk id, state, mount time) — it
+exposes no cache-fill metric, so it can't be used to detect warm-up either.
+
+### Takeaway / next steps
+
+On this object-backed disk, the only levers to hide the ~21.5 ms/file cold-read
+latency are **application-side**: read concurrently (`xargs -P`, parallel
+workers) or avoid many small files (pack into a tar/zip and read one blob). To
+actually benchmark `archil prefetch`, the workload needs a **native-format**
+Archil disk; the `benchmark-small-files-prefetch` task already runs prefetch
+best-effort and will measure the warm read automatically on such a disk (it
+reports `prefetch: unsupported` and reads cold on this one).
 
 ## Mount / unmount latency
 
@@ -160,6 +179,7 @@ All sub-second against the live mount:
 | `archil-demo` | ~4.8 s | mount → write/read small files → delegations → unmount |
 | `benchmark` | ~9.5 s | gen data → mount → 100 MiB write → remount → 100 MiB read → verify |
 | `benchmark-small-files` | ~4.6 min | gen 12k files → write → remount → cold metadata + content read → verify (read-bound) |
+| `benchmark-small-files-prefetch` | ~4 min | same as above + `archil prefetch` attempt (unsupported on this disk → cold read) |
 
 RWX layer caching means `install-archil` (and the base layers) are reused across
 runs — the first failed run and this successful run both hit cached layers for
@@ -185,10 +205,12 @@ cost.
 2. **Cold reads are network-bound** — ~24 MB/s for one large file, but they
    collapse to ~0.05 MB/s for many tiny files (~475× slower per byte) because
    each is a separate backend round-trip (~21.5 ms/file). Archil has no
-   read-ahead flag; hide the latency with **prefetch** (`archil mount
-   --pre-fetch` or the recursive, background `archil prefetch` command — see
-   [Archil read-ahead / prefetch options](#archil-read-ahead--prefetch-options))
-   and/or read concurrently.
+   read-ahead flag, and its `prefetch` command is **native-format only** — it
+   returns `InvalidArguments` on this object-backed disk, and the A/B benchmark
+   confirmed no speedup (see
+   [prefetch options](#archil-read-ahead--prefetch-options)). On this disk the
+   only levers are application-side: **read concurrently** (`xargs -P`) or
+   **avoid small files** (pack into one archive).
 3. **Small files are latency-bound, not bandwidth-bound.** Archil (like most
    networked/object-backed filesystems) strongly favors fewer, larger files.
    For CI caches of many small files, pack them into an archive (tar/zip) and
