@@ -5,7 +5,7 @@ on:
       region: aws-us-east-1
 
 base:
-  image: ubuntu:24.04
+  image: ubuntu:26.04
   config: rwx/base 1.0.2
 
 tasks:
